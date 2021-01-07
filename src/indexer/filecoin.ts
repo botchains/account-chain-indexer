@@ -12,10 +12,16 @@ import {
     FILECOIN_TESTNET_TOKEN,
     FILECOIN_TESTNET_URL,
 } from "../env";
-import { CYAN, RESET, SECONDS } from "../utils";
+import { CYAN, RESET, SECONDS, sleep } from "../utils";
 import { IndexerClass } from "./base";
+import { Filfox } from "./filecoin-filfox";
 
 type FilecoinClient = { request(method: string, ...args: any[]): Promise<any> };
+
+interface ClientPlusFilfox {
+    client: FilecoinClient;
+    filfox?: Filfox;
+}
 
 // TODO: Use database to track addresses.
 export const WATCHED_ADDRESSES = {
@@ -27,10 +33,12 @@ export const WATCHED_ADDRESSES = {
 };
 
 export class FilecoinIndexer extends IndexerClass<
-    FilecoinClient,
+    ClientPlusFilfox,
     FilecoinNetwork
 > {
     name = "Filecoin";
+
+    loopCount = 0;
 
     constructor(network: FilecoinNetwork) {
         super(network);
@@ -42,6 +50,7 @@ export class FilecoinIndexer extends IndexerClass<
         }
 
         let config;
+        let filfox: Filfox | undefined;
 
         switch (this.network) {
             case FilecoinNetwork.Testnet:
@@ -55,18 +64,22 @@ export class FilecoinIndexer extends IndexerClass<
                     apiAddress: FILECOIN_MAINNET_URL,
                     token: FILECOIN_MAINNET_TOKEN,
                 };
+                filfox = new Filfox(FilecoinNetwork.Mainnet);
                 break;
             default:
                 throw new Error(`Unsupported Filecoin network ${this.network}`);
         }
 
-        const client = new FilecoinClient(config);
-        this.client = client;
+        const client: FilecoinClient = new FilecoinClient(config);
+        this.client = {
+            client,
+            filfox,
+        };
 
-        return client;
+        return this.client;
     }
 
-    async loop(client: FilecoinClient) {
+    async loop({ client, filfox }: ClientPlusFilfox) {
         const chainState = await this.readDatabase();
 
         const asset = await Asset.findOneOrFail({
@@ -95,12 +108,65 @@ export class FilecoinIndexer extends IndexerClass<
                 }${RESET} to ${CYAN}${latestHeight}${RESET}`
             );
 
-            for (const watchesAddress of WATCHED_ADDRESSES[this.network]) {
+            for (const watchedAddress of WATCHED_ADDRESSES[this.network]) {
+                if (filfox && this.loopCount % 100 === 0) {
+                    try {
+                        let page = 0;
+                        const size = 10;
+                        while (page < 1) {
+                            const {
+                                deposits,
+                                totalCount,
+                            } = await filfox.fetchDeposits(
+                                watchedAddress,
+                                undefined,
+                                page,
+                                size
+                            );
+
+                            for (const transactionDetails of deposits) {
+                                try {
+                                    const exists = !!(await FilecoinTransaction.findOne(
+                                        {
+                                            cid: transactionDetails.cid,
+                                        }
+                                    ));
+
+                                    if (!exists) {
+                                        new FilecoinTransaction(
+                                            chainState,
+                                            asset,
+                                            transactionDetails
+                                        ).save();
+
+                                        console.log(
+                                            `[${this.name.toLowerCase()}][${
+                                                this.network
+                                            }] FOUND TRANSACTION THROUGH FILFOX:`,
+                                            transactionDetails
+                                        );
+                                    }
+                                } catch (error) {
+                                    console.error(error);
+                                }
+                            }
+
+                            if (page * size >= totalCount) {
+                                break;
+                            }
+
+                            page += 1;
+                        }
+                    } catch (error) {
+                        console.error(error);
+                    }
+                }
+
                 const latestTXs = await client.request(
                     "StateListMessages",
                     {
                         Version: 0,
-                        To: watchesAddress,
+                        To: watchedAddress,
                         From: null,
                         Nonce: 0,
                         Value: "0",
@@ -155,6 +221,8 @@ export class FilecoinIndexer extends IndexerClass<
 
             chainState.synced = latestHeight;
             await chainState.save();
+
+            this.loopCount += 1;
         } else {
             console.log(
                 `[${this.name.toLowerCase()}][${
@@ -172,7 +240,7 @@ export class FilecoinIndexer extends IndexerClass<
     }
 
     lastFetchedHeight: { height: number; time: number } | null = null;
-    async getLatestHeight(_client?: FilecoinClient): Promise<number> {
+    async getLatestHeight(_client?: ClientPlusFilfox): Promise<number> {
         // If the height was fetched within 10 seconds, return it.
         if (
             this.lastFetchedHeight &&
@@ -182,7 +250,7 @@ export class FilecoinIndexer extends IndexerClass<
         }
 
         // Fetch latest height.
-        const client = _client || (await this.connect());
+        const { client } = _client || (await this.connect());
         const chainHead = await client.request("ChainHead");
         const height = chainHead.Height;
 

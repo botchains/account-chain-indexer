@@ -14,6 +14,7 @@
         "@glif/filecoin-rpc-client": "^1.0.0-lerna.4",
         "@types/node": "^14.11.5",
         "apollo-server-express": "^2.18.2",
+        "bignumber.js": "^9.0.1",
         "class-validator": "^0.12.2",
         "cors": "^2.8.5",
         "express": "^4.17.1",
